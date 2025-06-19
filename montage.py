@@ -21,7 +21,12 @@ LOG_DIR = Path("./logs")
 LOG_FILE = LOG_DIR / "feedback.csv"
 WIN_THRESHOLD = 0.5 # The baseline smile intensity to be considered a "good" reaction
 DEFAULT_STEP_DURATION = 2.0 # Seconds to display an image if there's no sound
-COOLDOWN_DURATION = 3.0 # Seconds to wait between automated trials
+COOLDOWN_DURATION = 2.0 # Seconds to wait between automated trials
+EXPLICIT_REWARD_BONUS = 0.75 # A large bonus/penalty for explicit feedback
+MIN_MONTAGE_DURATION = 2.0 # Enforce a minimum display time for each trial
+SKIP_PENALTY = -0.25       # The negative reward applied when a trial is skipped
+GRADING_DURATION = 3.0 # Seconds to wait for user feedback after a trial
+
 
 # --- Layout Configuration ---
 CAM_W, CAM_H = 640, 480
@@ -71,18 +76,19 @@ except Exception as e:
 
 
 # --- 2. Reinforcement Learning Agent Class ---
+# --- [REVISED] 2. Reinforcement Learning Agent Class ---
 class RLAgent:
     """ 
-    Manages the learning process for decoupled actions (image categories and sound categories) 
-    using an epsilon-greedy strategy.
+    Manages the learning process for decoupled actions using the UCB1 algorithm
+    to intelligently balance exploration and exploitation.
     """
-    def __init__(self, image_actions, sound_actions, epsilon=1.0, epsilon_min=0.1, epsilon_decay=0.995):
+    def __init__(self, image_actions, sound_actions, c_param=2.0):
         self.image_actions = image_actions
         self.sound_actions = sound_actions
-        self.epsilon = epsilon
-        self.epsilon_min = epsilon_min
-        self.epsilon_decay = epsilon_decay
+        self.c_param = c_param  # Exploration parameter. Higher c = more exploration.
 
+        self.total_trials = 0
+        
         # Decoupled Q-tables for image and sound categories
         self.image_category_rewards = defaultdict(float)
         self.image_category_counts = defaultdict(int)
@@ -91,39 +97,56 @@ class RLAgent:
 
     def select_action(self):
         """ 
-        Selects an image category and a sound category using an epsilon-greedy strategy.
-        Both actions are explored or exploited together.
+        Selects an image and sound category using the UCB1 algorithm.
         """
-        if np.random.rand() < self.epsilon:
-            # Exploration: pick a random image category and a random sound category
-            selected_image_cat = np.random.choice(self.image_actions)
-            selected_sound_cat = np.random.choice(self.sound_actions)
+        # --- Select Image Category ---
+        # First, try any untried image categories to initialize them
+        untried_images = [cat for cat in self.image_actions if self.image_category_counts[cat] == 0]
+        if untried_images:
+            selected_image_cat = random.choice(untried_images)
         else:
-            # Exploitation: pick the best known image category and the best known sound category
-            selected_image_cat = max(self.image_actions, key=lambda cat: self.image_category_rewards[cat])
-            selected_sound_cat = max(self.sound_actions, key=lambda cat: self.sound_category_rewards[cat])
+            # If all have been tried, calculate UCB scores for all image categories
+            ucb_scores = {}
+            for cat in self.image_actions:
+                avg_reward = self.image_category_rewards[cat]
+                exploration_bonus = self.c_param * np.sqrt(np.log(self.total_trials) / self.image_category_counts[cat])
+                ucb_scores[cat] = avg_reward + exploration_bonus
+            selected_image_cat = max(ucb_scores, key=ucb_scores.get)
+
+        # --- Select Sound Category (using the same logic) ---
+        untried_sounds = [cat for cat in self.sound_actions if self.sound_category_counts[cat] == 0]
+        if untried_sounds:
+            selected_sound_cat = random.choice(untried_sounds)
+        else:
+            ucb_scores = {}
+            for cat in self.sound_actions:
+                avg_reward = self.sound_category_rewards[cat]
+                exploration_bonus = self.c_param * np.sqrt(np.log(self.total_trials) / self.sound_category_counts[cat])
+                ucb_scores[cat] = avg_reward + exploration_bonus
+            selected_sound_cat = max(ucb_scores, key=ucb_scores.get)
             
         return selected_image_cat, selected_sound_cat
 
     def update_q(self, image_category, sound_category, reward):
         """ 
-        Updates the Q-values for both the image category and the sound category
-        based on the received reward.
+        Updates the Q-values (average rewards) for both the image and sound category
+        and increments the total trial count.
         """
-        # Update Q-value for the image category
+        # This trial is now officially complete
+        self.total_trials += 1
+        
+        # Update stats for the image category
         self.image_category_counts[image_category] += 1
         n_img = self.image_category_counts[image_category]
         Q_img = self.image_category_rewards[image_category]
-        self.image_category_rewards[image_category] = Q_img + (reward - Q_img) / n_img
+        # Note: We are now storing the SUM of rewards, not the average, to simplify UCB calculation
+        self.image_category_rewards[image_category] += reward
 
-        # Update Q-value for the sound category
+        # Update stats for the sound category
         self.sound_category_counts[sound_category] += 1
         n_snd = self.sound_category_counts[sound_category]
         Q_snd = self.sound_category_rewards[sound_category]
-        self.sound_category_rewards[sound_category] = Q_snd + (reward - Q_snd) / n_snd
-        
-        # Decay epsilon to shift from exploration to exploitation over time
-        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        self.sound_category_rewards[sound_category] += reward
 
 
 # --- 3. Pre-flight Calibration & Agent Initialization ---
@@ -168,8 +191,10 @@ cv2.createTrackbar('Volume', WINDOW_NAME, 100, 100, volume_callback)
 
 # --- 5. Main Application Loop ---
 # State variables for the automated loop and our new category-based system
-app_mode = 'READY'
+app_mode = 'READY'  # Can be 'READY', 'PLAYING', 'COOLDOWN'
 smiles_this_montage = []
+explicit_feedback_this_montage = 0.0 # Will be + or - the bonus
+feedback_indicator_end_time = 0 # To show text on screen temporarily
 
 # Variables to track the chosen categories and files for the current trial
 active_image_category = None
@@ -180,6 +205,7 @@ active_sound_path = None
 montage_start_time = 0
 current_montage_duration = DEFAULT_STEP_DURATION
 cooldown_start_time = 0
+grading_start_time = 0
 current_meme_img = np.zeros((MEME_H, MEME_W, 3), dtype=np.uint8)
 
 def start_new_montage():
@@ -190,6 +216,7 @@ def start_new_montage():
 
     print("\n--- Agent selecting new categories ---")
     smiles_this_montage = []
+    explicit_feedback_this_montage = 0.0
     
     # 1. Agent selects CATEGORIES, not specific files
     active_image_category, active_sound_category = agent.select_action()
@@ -227,7 +254,7 @@ def start_new_montage():
         print(f"🔊 Playing: {Path(active_sound_path).name}")
     except Exception as e:
         print(f"Error playing sound: {e}")
-        current_montage_duration = DEFAULT_STEP_DURATION
+        current_montage_duration = MIN_MONTAGE_DURATION # Use our new constant
 
     montage_start_time = time.time()
     app_mode = 'PLAYING'
@@ -236,13 +263,14 @@ def start_new_montage():
 if not log_file_exists:
     csv_writer.writerow([
         "timestamp", "image_category", "sound_category", 
-        "image_path", "sound_path", "shaped_reward", 
+        "image_path", "sound_path", "outcome", "shaped_reward", 
         "avg_smile", "peak_smile"
     ])
 
 print("--- Starting Application ---")
 print("Press SPACE to begin the automated loop. Press 'q' to quit.")
 
+# --- REVISED Main Application and Drawing Loop ---
 while True:
     ret, frame = cap.read()
     if not ret: break
@@ -250,41 +278,84 @@ while True:
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'): break
 
+    # --- State Machine Logic ---
     if app_mode == 'READY':
         if key == ord(' '):
             start_new_montage()
 
     elif app_mode == 'PLAYING':
         smiles_this_montage.append(smile_intensity)
-        # A montage is now just one step. Check if its duration is over.
-        if time.time() - montage_start_time > current_montage_duration:
-            # --- End of Montage: Calculate Reward & Start Cooldown ---
+        
+        # Check for explicit user feedback during the montage
+        if key == ord('f'):
+            explicit_feedback_this_montage = EXPLICIT_REWARD_BONUS
+            feedback_indicator_end_time = time.time() + 1.5
+            print("--- [FEEDBACK] GOOD reaction registered! ---")
+        elif key == ord('b'):
+            explicit_feedback_this_montage = -EXPLICIT_REWARD_BONUS
+            feedback_indicator_end_time = time.time() + 1.5
+            print("--- [FEEDBACK] BAD reaction registered! ---")
+        elif key == ord('s'):
+            # Skip functionality
+            print("--- [ACTION] Trial Skipped by User ---")
             with audio_lock: app_state['stream_active'] = False
-            
-            print("--- Montage Finished: Calculating Reward ---")
+            agent.update_q(active_image_category, active_sound_category, SKIP_PENALTY)
+            csv_writer.writerow([
+                time.time(), active_image_category, active_sound_category,
+                active_image_path, active_sound_path, "skipped", f"{SKIP_PENALTY:.4f}", 0.0, 0.0
+            ])
+            csv_log_file.flush()
+            print(f"  Final Reward: {SKIP_PENALTY:.3f} (Skip Penalty)"); print("---")
+            app_mode = 'COOLDOWN'
+            cooldown_start_time = time.time()
+
+        # Check if the montage duration is over
+        if app_mode == 'PLAYING' and time.time() - montage_start_time > current_montage_duration:
+            # Transition to GRADING state
+            print("--- Montage Finished: Entering Grading Period ---")
+            with audio_lock: app_state['stream_active'] = False
+            app_mode = 'GRADING'
+            grading_start_time = time.time()
+
+    elif app_mode == 'GRADING':
+        # During the grading period, still listen for 'f' or 'b'
+        if key == ord('f'):
+            explicit_feedback_this_montage = EXPLICIT_REWARD_BONUS
+            feedback_indicator_end_time = time.time() + 1.5
+            print("--- [FEEDBACK] GOOD reaction registered! ---")
+        elif key == ord('b'):
+            explicit_feedback_this_montage = -EXPLICIT_REWARD_BONUS
+            feedback_indicator_end_time = time.time() + 1.5
+            print("--- [FEEDBACK] BAD reaction registered! ---")
+
+        # Check if the grading period is over
+        if time.time() - grading_start_time > GRADING_DURATION:
+            # End of Grading: Calculate Reward & Start Cooldown
+            print("--- Grading Period Finished: Calculating Reward ---")
             avg_smile = np.mean(smiles_this_montage) if smiles_this_montage else 0.0
             peak_smile = np.max(smiles_this_montage) if smiles_this_montage else 0.0
             raw_reward = 0.7 * avg_smile + 0.3 * peak_smile
             shaped_reward = raw_reward - WIN_THRESHOLD
             
-            # Update agent with the CATEGORIES that were shown
-            agent.update_q(active_image_category, active_sound_category, shaped_reward)
+            final_reward = shaped_reward + explicit_feedback_this_montage
+            print(f"  Implicit Reward: {shaped_reward:.3f}, Explicit Bonus: {explicit_feedback_this_montage:.2f}")
+
+            agent.update_q(active_image_category, active_sound_category, final_reward)
             
-            # Log the new format to the CSV file
             csv_writer.writerow([
                 time.time(), active_image_category, active_sound_category,
-                active_image_path, active_sound_path, f"{shaped_reward:.4f}", 
+                active_image_path, active_sound_path, "completed", f"{final_reward:.4f}", 
                 f"{avg_smile:.4f}", f"{peak_smile:.4f}"
             ])
             csv_log_file.flush()
             
             print(f"  Avg Smile:    {avg_smile:.3f}"); print(f"  Peak Smile:   {peak_smile:.3f}")
-            print(f"  Final Reward: {shaped_reward:.3f} (Raw - {WIN_THRESHOLD} threshold)")
-            print(f"  Epsilon:      {agent.epsilon:.2f}"); print("---")
+            print(f"  Final Reward: {final_reward:.3f} (Raw - Threshold + Bonus)")
+            print(f"  Total Trials: {agent.total_trials}"); print("---")
 
             app_mode = 'COOLDOWN'
             cooldown_start_time = time.time()
-    
+
     elif app_mode == 'COOLDOWN':
         if time.time() - cooldown_start_time > COOLDOWN_DURATION:
             start_new_montage()
@@ -293,21 +364,32 @@ while True:
     main_canvas = np.full((WINDOW_H, WINDOW_W, 3), 40, dtype=np.uint8)
     cam_display = cv2.resize(frame, (CAM_W, CAM_H))
     
-    if app_mode == 'PLAYING':
-        if current_meme_img is not None:
+    # Keep meme visible during PLAYING and GRADING states
+    if app_mode == 'PLAYING' or app_mode == 'GRADING':
+        if current_meme_img is not None and current_meme_img.shape[0] > 0:
              meme_display = cv2.resize(current_meme_img, (MEME_W, MEME_H))
         else:
              meme_display = np.zeros((MEME_H, MEME_W, 3), dtype=np.uint8)
     else:
         meme_display = np.zeros((MEME_H, MEME_W, 3), dtype=np.uint8)
-        if app_mode == 'READY':
-            cv2.putText(main_canvas, "Press SPACE to begin", (STATUS_X, STATUS_Y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        elif app_mode == 'COOLDOWN':
-            time_left = COOLDOWN_DURATION - (time.time() - cooldown_start_time)
-            cv2.putText(main_canvas, f"Next trial in {int(time_left)+1}s...", (STATUS_X, STATUS_Y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
+    # Update status text based on the current mode
+    if app_mode == 'READY':
+        cv2.putText(main_canvas, "Press SPACE to begin", (STATUS_X, STATUS_Y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    elif app_mode == 'GRADING':
+        time_left = GRADING_DURATION - (time.time() - grading_start_time)
+        cv2.putText(main_canvas, f"GRADE NOW (F/B)... {int(time_left)+1}s", (STATUS_X, STATUS_Y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+    elif app_mode == 'COOLDOWN':
+        time_left = COOLDOWN_DURATION - (time.time() - cooldown_start_time)
+        cv2.putText(main_canvas, f"Next trial in {int(time_left)+1}s...", (STATUS_X, STATUS_Y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
     main_canvas[0:CAM_H, 0:CAM_W] = cam_display
     main_canvas[0:MEME_H, CAM_W:CAM_W + MEME_W] = meme_display
+    
+    # Show feedback indicator text
+    if time.time() < feedback_indicator_end_time:
+        cv2.putText(main_canvas, "FEEDBACK REGISTERED", (STATUS_X, STATUS_Y - 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
     # Draw the smile meter
     cv2.rectangle(main_canvas, (METER_X, METER_Y), (METER_X + METER_W, METER_Y + METER_H), (50, 50, 50), 2)
