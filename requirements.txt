@@ -1,0 +1,6 @@
+opencv-python
+numpy
+sounddevice
+soundfile
+Pillow
+mediapipe

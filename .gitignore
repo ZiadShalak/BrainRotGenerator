@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment folders
+venv/
+.venv/
+env/
+
+# Generated Logs
+logs/
+
+# IDE specific
+.vscode/
+.idea/
+
+# OS specific
+.DS_Store
+Thumbs.db
