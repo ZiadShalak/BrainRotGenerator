@@ -5,6 +5,7 @@ import random
 from pathlib import Path
 import sounddevice as sd
 import soundfile as sf
+import itertools
 import time
 import json
 import threading
@@ -106,12 +107,35 @@ neutral_val, smile_val = run_interactive_calibration(cap)
 smile_detector = SmileDetector(neutral_frac=neutral_val, smile_frac=smile_val)
 print("--- Calibration Complete ---")
 
+# +++ This is the NEW block to paste in its place +++
 try:
-    print(f"Loading montage playlist from {MONTAGE_FILE}...")
-    with open(MONTAGE_FILE, 'r') as f:
-        montage_playlists = json.load(f)
-    if not montage_playlists: raise RuntimeError("Montage file is empty.")
-    print(f"Successfully loaded {len(montage_playlists)} montages.")
+    print("Scanning for images and sounds to dynamically create montage playlist...")
+
+    # Define supported file extensions
+    image_extensions = {'.png', '.jpg', '.jpeg'}
+    sound_extensions = {'.wav', '.mp3'}
+
+    # Scan directories for content files
+    image_paths = [p for p in IMG_DIR.glob('*') if p.suffix.lower() in image_extensions]
+    sound_paths = [p for p in SND_DIR.glob('*') if p.suffix.lower() in sound_extensions]
+
+    if not image_paths or not sound_paths:
+        raise RuntimeError("You must have at least one image and one sound in the respective directories.")
+
+    print(f"Found {len(image_paths)} images and {len(sound_paths)} sounds.")
+
+    # Create all possible pairs of (image, sound)
+    montage_playlists = []
+    for img_path, snd_path in itertools.product(image_paths, sound_paths):
+        montage = {
+            "images": [str(img_path)],
+            "sounds": [str(snd_path)]
+        }
+        montage_playlists.append(montage)
+
+    if not montage_playlists: raise RuntimeError("Failed to create any montages.")
+    print(f"Successfully generated {len(montage_playlists)} unique image/sound montages.")
+
 except Exception as e:
     print(f"Error loading assets: {e}"); cap.release(); exit()
 

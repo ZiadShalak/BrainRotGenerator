@@ -1,19 +1,16 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Virtual Environment folders
-venv/
-.venv/
-env/
+# Virtual Environment
+/.venv/
 
-# Generated Logs
-logs/
+# Log files - Optional, but good practice to ignore
+# user-specific generated data.
+/logs/
 
-# IDE specific
+# IDE / Editor specific
 .vscode/
 .idea/
-
-# OS specific
-.DS_Store
-Thumbs.db
