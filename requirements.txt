@@ -4,3 +4,13 @@ sounddevice
 soundfile
 Pillow
 mediapipe
+tensorflow
+tensorflow-hub
+tensorflow-datasets
+tensorflow-io
+scipy
+matplotlib
+scikit-learn
+scikit-image
+pandas
+
