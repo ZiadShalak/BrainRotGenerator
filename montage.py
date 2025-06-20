@@ -15,18 +15,16 @@ from collections import defaultdict
 from smile_detector import SmileDetector, run_interactive_calibration
 
 # --- 1. Configuration ---
-IMG_DIR = Path("./images")
-SND_DIR = Path("./sounds")
 LOG_DIR = Path("./logs")
 LOG_FILE = LOG_DIR / "feedback.csv"
-WIN_THRESHOLD = 0.5 # The baseline smile intensity to be considered a "good" reaction
-DEFAULT_STEP_DURATION = 2.0 # Seconds to display an image if there's no sound
-COOLDOWN_DURATION = 2.0 # Seconds to wait between automated trials
-EXPLICIT_REWARD_BONUS = 0.75 # A large bonus/penalty for explicit feedback
-MIN_MONTAGE_DURATION = 2.0 # Enforce a minimum display time for each trial
-SKIP_PENALTY = -0.25       # The negative reward applied when a trial is skipped
-GRADING_DURATION = 3.0 # Seconds to wait for user feedback after a trial
-
+WIN_THRESHOLD = 0.5
+DEFAULT_STEP_DURATION = 2.0
+COOLDOWN_DURATION = 3.0
+MIN_MONTAGE_DURATION = 2.0
+EXPLICIT_REWARD_BONUS = 0.75
+SKIP_PENALTY = -0.25
+GRADING_DURATION = 3.0
+LOAD_RETRY_ATTEMPTS = 3 # Number of times to try loading a file before giving up
 
 # --- Layout Configuration ---
 CAM_W, CAM_H = 640, 480
@@ -40,43 +38,38 @@ METER_X, METER_Y = 10, CAM_H + 40
 METER_W, METER_H = 200, 25
 STATUS_X, STATUS_Y = CAM_W + 20, CAM_H + 45
 
-
-# --- 1a. Load and Process Categorized Content ---
-IMG_CATS_FILE = Path("./image_categories.json")
-SND_CATS_FILE = Path("./sound_categories.json")
+# --- 1a. Load and Process Clustered Content ---
+# <-- UPDATED to load cluster data
+IMG_CLUSTER_FILE = Path("./data_outputs/image_cluster_data.json")
+SND_CLUSTER_FILE = Path("./data_outputs/sound_cluster_data.json")
 
 try:
-    print("Loading categorized content data...")
-    with open(IMG_CATS_FILE, 'r') as f:
+    print("Loading clustered content data...")
+    with open(IMG_CLUSTER_FILE, 'r') as f:
         image_data = json.load(f)
-    with open(SND_CATS_FILE, 'r') as f:
+    with open(SND_CLUSTER_FILE, 'r') as f:
         sound_data = json.load(f)
 
-    # Create an "inverted index" to easily find all files in a category
-    image_cats_to_files = defaultdict(list)
-    for path, category in image_data.items():
-        image_cats_to_files[category].append(path)
+    image_clusters = defaultdict(list)
+    for path, cluster_id in image_data.items():
+        image_clusters[f"img_cluster_{cluster_id}"].append(path)
 
-    sound_cats_to_files = defaultdict(list)
-    for path, category in sound_data.items():
-        sound_cats_to_files[category].append(path)
+    sound_clusters = defaultdict(list)
+    for path, cluster_id in sound_data.items():
+        sound_clusters[f"snd_cluster_{cluster_id}"].append(path)
         
-    # Get the lists of unique categories, which will be our new "actions"
-    image_actions = list(image_cats_to_files.keys())
-    sound_actions = list(sound_cats_to_files.keys())
+    image_cluster_ids = list(image_clusters.keys())
+    sound_cluster_ids = list(sound_clusters.keys())
 
-    print(f"Loaded {len(image_actions)} image categories and {len(sound_actions)} sound categories.")
-    if not image_actions or not sound_actions:
-        raise RuntimeError("One of the category files is empty or invalid.")
+    print(f"Loaded {len(image_cluster_ids)} image clusters and {len(sound_cluster_ids)} sound clusters.")
+    if not image_cluster_ids or not sound_cluster_ids:
+        raise RuntimeError("One of the cluster data files is empty or invalid.")
 
 except Exception as e:
-    print(f"FATAL ERROR: Could not load or process category JSON files: {e}")
-    # We can't continue without this data, so we exit.
+    print(f"FATAL ERROR: Could not load or process cluster JSON files: {e}")
     exit()
 
-
-# --- 2. Reinforcement Learning Agent Class ---
-# --- [REVISED] 2. Reinforcement Learning Agent Class ---
+# --- 2. Reinforcement Learning Agent Class (UCB Version) ---
 class RLAgent:
     """ 
     Manages the learning process for decoupled actions using the UCB1 algorithm
@@ -85,69 +78,55 @@ class RLAgent:
     def __init__(self, image_actions, sound_actions, c_param=2.0):
         self.image_actions = image_actions
         self.sound_actions = sound_actions
-        self.c_param = c_param  # Exploration parameter. Higher c = more exploration.
+        self.c_param = c_param  # Exploration parameter
 
         self.total_trials = 0
         
-        # Decoupled Q-tables for image and sound categories
         self.image_category_rewards = defaultdict(float)
         self.image_category_counts = defaultdict(int)
         self.sound_category_rewards = defaultdict(float)
         self.sound_category_counts = defaultdict(int)
 
     def select_action(self):
-        """ 
-        Selects an image and sound category using the UCB1 algorithm.
-        """
-        # --- Select Image Category ---
-        # First, try any untried image categories to initialize them
+        """ Selects an image and sound cluster ID using the UCB1 algorithm. """
+        # --- Select Image Cluster ---
         untried_images = [cat for cat in self.image_actions if self.image_category_counts[cat] == 0]
         if untried_images:
             selected_image_cat = random.choice(untried_images)
         else:
-            # If all have been tried, calculate UCB scores for all image categories
             ucb_scores = {}
+            # We add 1 to total_trials in the log to avoid log(0) issues on the first real UCB step
+            log_total = np.log(self.total_trials + 1)
             for cat in self.image_actions:
-                avg_reward = self.image_category_rewards[cat]
-                exploration_bonus = self.c_param * np.sqrt(np.log(self.total_trials) / self.image_category_counts[cat])
+                avg_reward = self.image_category_rewards[cat] / self.image_category_counts[cat]
+                exploration_bonus = self.c_param * np.sqrt(log_total / self.image_category_counts[cat])
                 ucb_scores[cat] = avg_reward + exploration_bonus
             selected_image_cat = max(ucb_scores, key=ucb_scores.get)
 
-        # --- Select Sound Category (using the same logic) ---
+        # --- Select Sound Cluster ---
         untried_sounds = [cat for cat in self.sound_actions if self.sound_category_counts[cat] == 0]
         if untried_sounds:
             selected_sound_cat = random.choice(untried_sounds)
         else:
             ucb_scores = {}
+            log_total = np.log(self.total_trials + 1)
             for cat in self.sound_actions:
-                avg_reward = self.sound_category_rewards[cat]
-                exploration_bonus = self.c_param * np.sqrt(np.log(self.total_trials) / self.sound_category_counts[cat])
+                avg_reward = self.sound_category_rewards[cat] / self.sound_category_counts[cat]
+                exploration_bonus = self.c_param * np.sqrt(log_total / self.sound_category_counts[cat])
                 ucb_scores[cat] = avg_reward + exploration_bonus
             selected_sound_cat = max(ucb_scores, key=ucb_scores.get)
             
         return selected_image_cat, selected_sound_cat
 
     def update_q(self, image_category, sound_category, reward):
-        """ 
-        Updates the Q-values (average rewards) for both the image and sound category
-        and increments the total trial count.
-        """
-        # This trial is now officially complete
+        """ Updates the Q-values for both the image and sound cluster. """
         self.total_trials += 1
         
-        # Update stats for the image category
         self.image_category_counts[image_category] += 1
-        n_img = self.image_category_counts[image_category]
-        Q_img = self.image_category_rewards[image_category]
-        # Note: We are now storing the SUM of rewards, not the average, to simplify UCB calculation
         self.image_category_rewards[image_category] += reward
 
-        # Update stats for the sound category
         self.sound_category_counts[sound_category] += 1
-        n_snd = self.sound_category_counts[sound_category]
-        Q_snd = self.sound_category_rewards[sound_category]
         self.sound_category_rewards[sound_category] += reward
-
 
 # --- 3. Pre-flight Calibration & Agent Initialization ---
 print("Initializing camera for calibration...")
@@ -157,8 +136,8 @@ neutral_val, smile_val = run_interactive_calibration(cap)
 smile_detector = SmileDetector(neutral_frac=neutral_val, smile_frac=smile_val)
 print("--- Calibration Complete ---")
 
-# Initialize our new, redesigned agent with the category lists
-agent = RLAgent(image_actions=image_actions, sound_actions=sound_actions)
+# Initialize agent with the CLUSTER IDs as actions
+agent = RLAgent(image_actions=image_cluster_ids, sound_actions=sound_cluster_ids)
 
 # Setup CSV Logger
 LOG_DIR.mkdir(exist_ok=True)
@@ -168,6 +147,7 @@ csv_writer = csv.writer(csv_log_file)
 
 
 # --- 4. Main Application Setup (Audio) ---
+# This section is unchanged
 app_state = {'volume': 1.0, 'audio_data': None, 'audio_position': 0, 'stream_active': False}
 audio_lock = threading.Lock()
 def audio_callback(outdata, frames, time, status):
@@ -190,15 +170,14 @@ cv2.createTrackbar('Volume', WINDOW_NAME, 100, 100, volume_callback)
 
 
 # --- 5. Main Application Loop ---
-# State variables for the automated loop and our new category-based system
-app_mode = 'READY'  # Can be 'READY', 'PLAYING', 'COOLDOWN'
+# This section contains all our recent UX improvements
+app_mode = 'READY'
 smiles_this_montage = []
-explicit_feedback_this_montage = 0.0 # Will be + or - the bonus
-feedback_indicator_end_time = 0 # To show text on screen temporarily
+explicit_feedback_this_montage = 0.0
+feedback_indicator_end_time = 0
 
-# Variables to track the chosen categories and files for the current trial
-active_image_category = None
-active_sound_category = None
+active_image_cluster_id = None # <-- UPDATED
+active_sound_cluster_id = None # <-- UPDATED
 active_image_path = None
 active_sound_path = None
 
@@ -209,60 +188,76 @@ grading_start_time = 0
 current_meme_img = np.zeros((MEME_H, MEME_W, 3), dtype=np.uint8)
 
 def start_new_montage():
-    """Helper function to reset state and start a new category-based montage."""
-    global smiles_this_montage, active_image_category, active_sound_category
+    """Helper function to reset state and start a new cluster-based montage."""
+    global smiles_this_montage, active_image_cluster_id, active_sound_cluster_id
     global active_image_path, active_sound_path, current_montage_duration
-    global montage_start_time, app_mode, current_meme_img
+    global montage_start_time, app_mode, current_meme_img, explicit_feedback_this_montage
 
-    print("\n--- Agent selecting new categories ---")
+    print("\n--- Agent selecting new clusters ---")
     smiles_this_montage = []
     explicit_feedback_this_montage = 0.0
-    
-    # 1. Agent selects CATEGORIES, not specific files
-    active_image_category, active_sound_category = agent.select_action()
-    print(f"Agent chose categories: [Image: {active_image_category}] - [Sound: {active_sound_category}]")
 
-    # 2. Randomly sample one file from each chosen category
+    active_image_cluster_id, active_sound_cluster_id = agent.select_action()
+    print(f"Agent chose clusters: [Image: {active_image_cluster_id}] - [Sound: {active_sound_cluster_id}]")
+
     try:
-        image_path_list = image_cats_to_files[active_image_category]
+        image_path_list = image_clusters[active_image_cluster_id]
         active_image_path = random.choice(image_path_list)
-        
-        sound_path_list = sound_cats_to_files[active_sound_category]
+
+        sound_path_list = sound_clusters[active_sound_cluster_id]
         active_sound_path = random.choice(sound_path_list)
     except (KeyError, IndexError) as e:
-        print(f"Error sampling from categories: {e}. Skipping trial.")
-        app_mode = 'COOLDOWN' # Skip to cooldown if we can't find files
+        print(f"Error sampling from clusters: {e}. Skipping trial.")
+        app_mode = 'COOLDOWN'
         cooldown_start_time = time.time()
         return
 
-    # 3. Load the randomly selected image
-    try:
-        current_meme_img = cv2.imread(active_image_path)
-        print(f"🖼️  Displaying: {Path(active_image_path).name}")
-    except Exception as e:
-        print(f"Error loading image: {e}"); current_meme_img.fill(0)
-    
-    # 4. Load and play the randomly selected sound
-    try:
-        data, fs = sf.read(active_sound_path, dtype='float32')
-        current_montage_duration = len(data) / fs
-        if data.ndim == 1: data = np.column_stack((data, data))
-        with audio_lock:
-            app_state['audio_data'] = data
-            app_state['audio_position'] = 0
-            app_state['stream_active'] = True
-        print(f"🔊 Playing: {Path(active_sound_path).name}")
-    except Exception as e:
-        print(f"Error playing sound: {e}")
-        current_montage_duration = MIN_MONTAGE_DURATION # Use our new constant
+    # --- NEW: Retry loop for loading the image ---
+    image_loaded = False
+    for attempt in range(LOAD_RETRY_ATTEMPTS):
+        try:
+            current_meme_img = cv2.imread(str(active_image_path))
+            if current_meme_img is None:
+                raise IOError("OpenCV could not decode the image file.")
+            print(f"🖼️  Displaying: {Path(active_image_path).name}")
+            image_loaded = True
+            break # Success, exit the retry loop
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed to load image '{active_image_path}': {e}")
+            if attempt < LOAD_RETRY_ATTEMPTS - 1:
+                time.sleep(0.1) # Wait briefly before retrying
+    if not image_loaded:
+        current_meme_img = np.zeros((MEME_H, MEME_W, 3), dtype=np.uint8)
 
+    # --- NEW: Retry loop for loading the sound ---
+    sound_loaded = False
+    for attempt in range(LOAD_RETRY_ATTEMPTS):
+        try:
+            data, fs = sf.read(active_sound_path, dtype='float32')
+            current_montage_duration = len(data) / fs
+            if data.ndim == 1: data = np.column_stack((data, data))
+            with audio_lock:
+                app_state['audio_data'] = data
+                app_state['audio_position'] = 0
+                app_state['stream_active'] = True
+            print(f"🔊 Playing: {Path(active_sound_path).name}")
+            sound_loaded = True
+            break # Success, exit the retry loop
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed to play sound '{active_sound_path}': {e}")
+            if attempt < LOAD_RETRY_ATTEMPTS - 1:
+                time.sleep(0.1)
+    if not sound_loaded:
+        current_montage_duration = MIN_MONTAGE_DURATION
+
+    current_montage_duration = max(current_montage_duration, MIN_MONTAGE_DURATION)
     montage_start_time = time.time()
     app_mode = 'PLAYING'
 
-# Update CSV logging to handle new category format
+# Update CSV logging to handle new cluster format
 if not log_file_exists:
     csv_writer.writerow([
-        "timestamp", "image_category", "sound_category", 
+        "timestamp", "image_cluster_id", "sound_cluster_id", # <-- UPDATED
         "image_path", "sound_path", "outcome", "shaped_reward", 
         "avg_smile", "peak_smile"
     ])
@@ -270,7 +265,6 @@ if not log_file_exists:
 print("--- Starting Application ---")
 print("Press SPACE to begin the automated loop. Press 'q' to quit.")
 
-# --- REVISED Main Application and Drawing Loop ---
 while True:
     ret, frame = cap.read()
     if not ret: break
@@ -278,7 +272,7 @@ while True:
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'): break
 
-    # --- State Machine Logic ---
+    # State Machine Logic
     if app_mode == 'READY':
         if key == ord(' '):
             start_new_montage()
@@ -286,7 +280,6 @@ while True:
     elif app_mode == 'PLAYING':
         smiles_this_montage.append(smile_intensity)
         
-        # Check for explicit user feedback during the montage
         if key == ord('f'):
             explicit_feedback_this_montage = EXPLICIT_REWARD_BONUS
             feedback_indicator_end_time = time.time() + 1.5
@@ -296,12 +289,11 @@ while True:
             feedback_indicator_end_time = time.time() + 1.5
             print("--- [FEEDBACK] BAD reaction registered! ---")
         elif key == ord('s'):
-            # Skip functionality
             print("--- [ACTION] Trial Skipped by User ---")
             with audio_lock: app_state['stream_active'] = False
-            agent.update_q(active_image_category, active_sound_category, SKIP_PENALTY)
+            agent.update_q(active_image_cluster_id, active_sound_cluster_id, SKIP_PENALTY)
             csv_writer.writerow([
-                time.time(), active_image_category, active_sound_category,
+                time.time(), active_image_cluster_id, active_sound_cluster_id,
                 active_image_path, active_sound_path, "skipped", f"{SKIP_PENALTY:.4f}", 0.0, 0.0
             ])
             csv_log_file.flush()
@@ -309,16 +301,13 @@ while True:
             app_mode = 'COOLDOWN'
             cooldown_start_time = time.time()
 
-        # Check if the montage duration is over
         if app_mode == 'PLAYING' and time.time() - montage_start_time > current_montage_duration:
-            # Transition to GRADING state
             print("--- Montage Finished: Entering Grading Period ---")
             with audio_lock: app_state['stream_active'] = False
             app_mode = 'GRADING'
             grading_start_time = time.time()
 
     elif app_mode == 'GRADING':
-        # During the grading period, still listen for 'f' or 'b'
         if key == ord('f'):
             explicit_feedback_this_montage = EXPLICIT_REWARD_BONUS
             feedback_indicator_end_time = time.time() + 1.5
@@ -328,9 +317,7 @@ while True:
             feedback_indicator_end_time = time.time() + 1.5
             print("--- [FEEDBACK] BAD reaction registered! ---")
 
-        # Check if the grading period is over
         if time.time() - grading_start_time > GRADING_DURATION:
-            # End of Grading: Calculate Reward & Start Cooldown
             print("--- Grading Period Finished: Calculating Reward ---")
             avg_smile = np.mean(smiles_this_montage) if smiles_this_montage else 0.0
             peak_smile = np.max(smiles_this_montage) if smiles_this_montage else 0.0
@@ -340,10 +327,10 @@ while True:
             final_reward = shaped_reward + explicit_feedback_this_montage
             print(f"  Implicit Reward: {shaped_reward:.3f}, Explicit Bonus: {explicit_feedback_this_montage:.2f}")
 
-            agent.update_q(active_image_category, active_sound_category, final_reward)
+            agent.update_q(active_image_cluster_id, active_sound_cluster_id, final_reward) # <-- UPDATED
             
             csv_writer.writerow([
-                time.time(), active_image_category, active_sound_category,
+                time.time(), active_image_cluster_id, active_sound_cluster_id, # <-- UPDATED
                 active_image_path, active_sound_path, "completed", f"{final_reward:.4f}", 
                 f"{avg_smile:.4f}", f"{peak_smile:.4f}"
             ])
@@ -351,7 +338,7 @@ while True:
             
             print(f"  Avg Smile:    {avg_smile:.3f}"); print(f"  Peak Smile:   {peak_smile:.3f}")
             print(f"  Final Reward: {final_reward:.3f} (Raw - Threshold + Bonus)")
-            print(f"  Total Trials: {agent.total_trials}"); print("---")
+            print(f"  Total Trials: {agent.total_trials}"); print("---") # <-- UPDATED
 
             app_mode = 'COOLDOWN'
             cooldown_start_time = time.time()
@@ -364,7 +351,6 @@ while True:
     main_canvas = np.full((WINDOW_H, WINDOW_W, 3), 40, dtype=np.uint8)
     cam_display = cv2.resize(frame, (CAM_W, CAM_H))
     
-    # Keep meme visible during PLAYING and GRADING states
     if app_mode == 'PLAYING' or app_mode == 'GRADING':
         if current_meme_img is not None and current_meme_img.shape[0] > 0:
              meme_display = cv2.resize(current_meme_img, (MEME_W, MEME_H))
@@ -373,7 +359,6 @@ while True:
     else:
         meme_display = np.zeros((MEME_H, MEME_W, 3), dtype=np.uint8)
 
-    # Update status text based on the current mode
     if app_mode == 'READY':
         cv2.putText(main_canvas, "Press SPACE to begin", (STATUS_X, STATUS_Y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     elif app_mode == 'GRADING':
@@ -386,7 +371,6 @@ while True:
     main_canvas[0:CAM_H, 0:CAM_W] = cam_display
     main_canvas[0:MEME_H, CAM_W:CAM_W + MEME_W] = meme_display
     
-    # Show feedback indicator text
     if time.time() < feedback_indicator_end_time:
         cv2.putText(main_canvas, "FEEDBACK REGISTERED", (STATUS_X, STATUS_Y - 30), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
