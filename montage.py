@@ -18,6 +18,7 @@ from emotion_detector import EmotionDetector, run_interactive_calibration
 LOG_DIR = Path("./logs")
 LOG_FILE = LOG_DIR / "feedback.csv"
 AGENT_MEMORY_FILE = LOG_DIR / "agent_memory.json"
+
 WIN_THRESHOLD = 0.5
 DEFAULT_STEP_DURATION = 2.0
 COOLDOWN_DURATION = 3.0
@@ -183,6 +184,7 @@ if not log_file_exists:
 
 
 # --- 4. Main Application Setup (Audio) ---
+# This section is unchanged
 app_state = {'volume': 1.0, 'audio_data': None, 'audio_position': 0, 'stream_active': False}
 audio_lock = threading.Lock()
 def audio_callback(outdata, frames, time, status):
