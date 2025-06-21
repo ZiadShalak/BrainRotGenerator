@@ -1,16 +1,12 @@
+# Requirements for the DeepFace Emotion Recognition approach
+tensorflow
+deepface
 opencv-python
-numpy
 sounddevice
 soundfile
-Pillow
-mediapipe
-tensorflow
-tensorflow-hub
-tensorflow-datasets
-tensorflow-io
-scipy
-matplotlib
+librosa
 scikit-learn
-scikit-image
 pandas
+tqdm
+matplotlib
 seaborn
