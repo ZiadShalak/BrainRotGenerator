@@ -1,6 +1,6 @@
 # C:/AIVisionTest/debug_loader.py
-import cv2
-import librosa
+import cv2 # type: ignore
+import librosa # type: ignore
 from pathlib import Path
 
 # --- IMPORTANT: Update these two lines to match the files you copied ---

@@ -1,8 +1,8 @@
 # emotion_detector.py
-import cv2
-from deepface import DeepFace
+import cv2 # type: ignore
+from deepface import DeepFace # type: ignore
 import time
-import numpy as np
+import numpy as np # type: ignore
 
 # --- Configuration ---
 FACE_DETECTOR_BACKEND = 'opencv'

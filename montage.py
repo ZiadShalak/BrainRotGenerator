@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-import cv2
-import numpy as np
+import cv2 # type: ignore
+import numpy as np # type: ignore
 import random
 from pathlib import Path
-import sounddevice as sd
-import soundfile as sf
+import sounddevice as sd # type: ignore
+import soundfile as sf # type: ignore
 import time
 import json
 import threading
 import csv
 from collections import defaultdict
 
-# We use our stable, refactored emotion_detector module
-from emotion_detector import EmotionDetector, run_interactive_calibration
+from mediapipe_detector import SmileDetector, run_interactive_calibration
 
 # --- 1. Configuration ---
 LOG_DIR = Path("./logs")
@@ -34,9 +33,10 @@ SEPARATOR_SUB = "-" * 25
 
 # --- Layout Configuration ---
 CAM_W, CAM_H = 640, 480
-MEME_W, MEME_H = 640, 480
+# --- FIX: Changed MEME_W to 480 to match the expected image shape ---
+MEME_W, MEME_H = 480, 480
 WINDOW_W = CAM_W + MEME_W
-WINDOW_H = MEME_H + 80
+WINDOW_H = MEME_H + 120
 WINDOW_NAME = "Meme Montage RL"
 
 # --- Meter and Text Configuration ---
@@ -167,7 +167,7 @@ print("Initializing camera for calibration...")
 cap = cv2.VideoCapture(0)
 if not cap.isOpened(): raise IOError("Cannot open webcam")
 neutral_val, smile_val = run_interactive_calibration(cap)
-emotion_detector = EmotionDetector(neutral_score=neutral_val, smile_score=smile_val)
+smile_detector = SmileDetector(neutral_ratio=neutral_val, smile_ratio=smile_val)
 print("--- Calibration Complete ---")
 agent = RLAgent(image_actions=image_cluster_ids, sound_actions=sound_cluster_ids)
 agent.load_state(AGENT_MEMORY_FILE)
@@ -184,7 +184,6 @@ if not log_file_exists:
 
 
 # --- 4. Main Application Setup (Audio) ---
-# This section is unchanged
 app_state = {'volume': 1.0, 'audio_data': None, 'audio_position': 0, 'stream_active': False}
 audio_lock = threading.Lock()
 def audio_callback(outdata, frames, time, status):
@@ -217,7 +216,6 @@ montage_start_time, current_montage_duration = 0, DEFAULT_STEP_DURATION
 cooldown_start_time, grading_start_time = 0, 0
 current_meme_img = np.zeros((MEME_H, MEME_W, 3), dtype=np.uint8)
 
-# --- NEW: Session Tracking Variables ---
 session_start_time = time.time()
 session_graded_montages = 0
 
@@ -290,7 +288,7 @@ print(SEPARATOR_MAIN)
 while True:
     ret, frame = cap.read()
     if not ret: break
-    smile_intensity, face_detected = emotion_detector.get_happy_score(frame)
+    smile_intensity, face_detected = smile_detector.get_smile_intensity(frame)
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'): break
 
@@ -315,7 +313,7 @@ while True:
             csv_writer.writerow([
                 time.time(), active_image_cluster_id, active_sound_cluster_id,
                 active_image_path, active_sound_path, "skipped", f"{SKIP_PENALTY:.4f}", 
-                0.0, 0.0, -1 # -1 for rating indicates a skip
+                0.0, 0.0, -1
             ])
             csv_log_file.flush()
             app_mode = 'COOLDOWN'
@@ -404,7 +402,7 @@ while True:
         cv2.putText(main_canvas, "FEEDBACK REGISTERED", (STATUS_X, STATUS_Y - 30), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-    if not emotion_detector.last_face_region: # Assuming emotion_detector has this attribute
+    if not smile_detector.face_is_currently_detected:
          text = "NO FACE DETECTED"
          (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
          cv2.rectangle(main_canvas, (5, 5), (15 + text_w, 15 + text_h), (0,0,0), -1)
@@ -430,6 +428,7 @@ print(f"Total Montages Graded: {session_graded_montages}")
 print(SEPARATOR_MAIN)
 
 agent.save_state(AGENT_MEMORY_FILE)
+smile_detector.close()
 stream.stop()
 stream.close()
 cap.release()
